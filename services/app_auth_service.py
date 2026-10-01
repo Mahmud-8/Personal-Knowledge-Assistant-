@@ -23,7 +23,7 @@ password_hasher = PasswordHash.recommended()
 # Note: This is used as a dependency in FastAPI routes to get the token from the request.
 # This enable the authorize button in the Swagger UI.
 # The token is then passed to the verify_access_token function to extract the user_id. 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
 
 
 def hash_password(password: str) -> str:

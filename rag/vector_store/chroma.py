@@ -151,6 +151,23 @@ class ChromaVectorStore(VectorStore):
 
         return chunks
 
+    def has_email(self, email_id: str) -> bool:
+        """Return True if an email with the given ID already exists."""
+        if not email_id:
+             return False
+
+        results = self._collection.get(
+            where={
+                "$and": [
+                    {"source_type": "email"},
+                    {"email_id": email_id},
+                ]
+            },
+            limit=1,
+        )
+
+        return bool(results.get("ids"))
+
     def delete(self, ids: Optional[List[str]] = None) -> None:
         if ids is None:
             self._collection.delete()

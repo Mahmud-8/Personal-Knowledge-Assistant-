@@ -16,6 +16,18 @@ from agent.llm_client import call_llm, LLMResponseError
 from agent.tool_executer import execute_tool
 from agent.system_prompt import SYSTEM_PROMPT
 
+
+def build_incoming_email_prompt(email) -> str:
+    """Build structured context for an incoming email."""
+    return (
+        "Incoming email:\n"
+        f"Sender: {email.sender}\n"
+        f"Subject: {email.subject}\n"
+        f"Body:\n{email.body}\n\n"
+        "Handle this email according to the system instructions."
+    )
+
+
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 10
@@ -60,6 +72,11 @@ def run(state: AgentState) -> str:
         for tool_call in message.tool_calls:
             name = tool_call.function.name
             args = json.loads(tool_call.function.arguments)
+
+            # Pass the authenticated user context to tools that need it.
+            if name == "send_email_reply":
+                args["_user_id"] = state.user_id
+
             logger.info("Tool call: %s(%s)", name, args)
 
             result = execute_tool(name, args)

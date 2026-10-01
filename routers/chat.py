@@ -42,7 +42,12 @@ def chat(req: ChatPostRequest, user=Depends(get_current_user)):
     key = _session_key(user.id, session_id)
 
     messages = _sessions.get(key, [])
-    state = AgentState(user_input=req.message, messages=messages)
+    
+    state = AgentState(
+    user_input=req.message,
+    messages=messages,
+    user_id=user.id,
+)
 
     reply = run(state)
 

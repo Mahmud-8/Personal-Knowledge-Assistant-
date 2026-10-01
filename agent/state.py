@@ -9,16 +9,28 @@ from __future__ import annotations
 
 
 class AgentState:
-    """Holds the conversation history and current user input."""
+    """Holds the authenticated user context and conversation history."""
 
-    def __init__(self, user_input: str, messages: list[dict] | None = None) -> None:
+    def __init__(
+        self,
+        user_id: int,
+        user_input: str,
+        messages: list[dict] | None = None,
+    ) -> None:
+        self.user_id = user_id
         self.user_input = user_input
         self.messages: list[dict] = list(messages) if messages else []
-        self.messages.append({"role": "user", "content": user_input})
+        self.messages.append({
+            "role": "user",
+            "content": user_input,
+        })
 
     def add_message(self, role: str, content: str) -> None:
         """Append a message to the conversation history."""
-        self.messages.append({"role": role, "content": content})
+        self.messages.append({
+            "role": role,
+            "content": content,
+        })
 
     def add_tool_result(self, tool_call_id: str, content: str) -> None:
         """Append a tool result to the conversation history."""

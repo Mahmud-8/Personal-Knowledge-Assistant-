@@ -9,14 +9,14 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 
 from services.app_auth_service import (
     oauth2_scheme,
     create_access_token,
     hash_password,
     verify_password,
-    revoke_token, 
-    
+    revoke_token,
 )
 from initializer import db
 from schemas.app_auth import LoginRequest, LoginResponse, RegisterRequest
@@ -35,15 +35,17 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 def register(req: RegisterRequest):
     """Register a new user with email and password."""
     if db.user_exists(req.email):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
-                            detail="Email already registered."
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email already registered.",
         )
 
     db.create_user(
         name=req.name,
         email=req.email,
-        password_hash=hash_password(req.password)
+        password_hash=hash_password(req.password),
     )
+
     return {"message": "User registered successfully."}
 
 
@@ -56,10 +58,35 @@ def register(req: RegisterRequest):
 def login(req: LoginRequest):
     """Authenticate a user and return a JWT token."""
     user = db.find_user_by_email(req.email)
+
     if not user or not verify_password(req.password, user.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+        )
 
     token = create_access_token(data={"sub": str(user.id)})
+
+    return LoginResponse(access_token=token)
+
+
+@router.post(
+    "/token",
+    response_model=LoginResponse,
+    include_in_schema=False,
+)
+def token(form_data: OAuth2PasswordRequestForm = Depends()):
+    """OAuth2-compatible token endpoint for Swagger UI."""
+    user = db.find_user_by_email(form_data.username)
+
+    if not user or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+        )
+
+    token = create_access_token(data={"sub": str(user.id)})
+
     return LoginResponse(access_token=token)
 
 
@@ -71,4 +98,5 @@ def login(req: LoginRequest):
 def logout(token: str = Depends(oauth2_scheme)):
     """Revoke the current access token."""
     revoke_token(token)
+
     return {"message": "Logged out successfully."}

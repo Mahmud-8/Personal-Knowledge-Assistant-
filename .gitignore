@@ -25,6 +25,7 @@ env/
 
 # ChromaDB / vector store data
 vectoredb/
+data/
 
 # Telethon sessions
 *.session

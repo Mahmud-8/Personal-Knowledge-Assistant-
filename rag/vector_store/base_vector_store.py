@@ -46,6 +46,11 @@ class VectorStore(ABC):
         """
 
     @abstractmethod
+    def has_email(self, email_id: str) -> bool:
+         """Return True if an email with the given ID already exists in the store."""
+
+
+    @abstractmethod
     def delete(self, ids: Optional[List[str]] = None) -> None:
         """Delete documents by their IDs.
 
