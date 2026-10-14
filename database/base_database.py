@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from database.models import DiscordCredentialRow, GoogleCredentialRow, SlackCredentialRow, TelegramCredentialRow, User
+from database.models import (
+    DiscordCredentialRow,
+    GmailReplyStateRow,
+    GmailSyncStateRow,
+    GoogleCredentialRow,
+    SlackCredentialRow,
+    TelegramCredentialRow,
+    User,
+)
 
 
 class BaseDatabase(ABC):
@@ -183,3 +191,93 @@ class BaseDatabase(ABC):
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
         """Retrieve stored cleaned messages."""
+
+    # ------------------------------------------------------------------
+    # Gmail auto-responder settings, watch/sync state, reply states
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def get_autoresponder_enabled(self, user_id: int) -> bool:
+        """Return the user's auto-responder opt-in (False if the user is unknown)."""
+
+    @abstractmethod
+    def set_autoresponder_enabled(self, user_id: int, enabled: bool) -> None:
+        """Persist the user's auto-responder opt-in."""
+
+    @abstractmethod
+    def find_gmail_sync_state(self, user_id: int) -> Optional[GmailSyncStateRow]:
+        """Return the Gmail sync state for a user, or None."""
+
+    @abstractmethod
+    def find_gmail_sync_state_by_email(self, email_address: str) -> Optional[GmailSyncStateRow]:
+        """Return the Gmail sync state for a mailbox address, or None."""
+
+    @abstractmethod
+    def list_gmail_sync_states(self) -> List[GmailSyncStateRow]:
+        """Return all Gmail sync states."""
+
+    @abstractmethod
+    def save_gmail_watch(
+        self,
+        user_id: int,
+        *,
+        email_address: str,
+        history_id: int,
+        expiration: Optional[datetime],
+        reset_history: bool = False,
+    ) -> GmailSyncStateRow:
+        """Record an active watch.
+
+        `history_id` only seeds a missing sync pointer unless `reset_history`
+        is set, in which case sync restarts from it.
+        """
+
+    @abstractmethod
+    def update_gmail_sync_state(self, user_id: int, **fields: Any) -> None:
+        """Update arbitrary columns of a user's Gmail sync state."""
+
+    @abstractmethod
+    def advance_gmail_history_id(self, user_id: int, history_id: int) -> bool:
+        """Move the sync pointer forward only; returns True if it moved."""
+
+    @abstractmethod
+    def claim_gmail_message(
+        self,
+        user_id: int,
+        gmail_message_id: str,
+        *,
+        lock_timeout: timedelta,
+        max_attempts: int,
+    ) -> Optional[GmailReplyStateRow]:
+        """Atomically claim a Gmail message for processing.
+
+        Returns the claimed row (with a fresh `lock_token`), or None when the
+        message is finished, out of attempts, or owned by another worker.
+        """
+
+    @abstractmethod
+    def update_gmail_reply_state(
+        self,
+        user_id: int,
+        gmail_message_id: str,
+        lock_token: str,
+        *,
+        release: bool = False,
+        **fields: Any,
+    ) -> bool:
+        """Update a claimed reply state. Only the lock holder may write."""
+
+    @abstractmethod
+    def list_gmail_reply_work(
+        self,
+        user_id: int,
+        *,
+        lock_timeout: timedelta,
+        max_attempts: int,
+        limit: int = 20,
+    ) -> List[str]:
+        """Return Gmail message IDs with retryable unfinished work."""
+
+    @abstractmethod
+    def list_gmail_reply_states(self, user_id: int, limit: int = 10) -> List[GmailReplyStateRow]:
+        """Return the user's most recently updated reply states."""

@@ -36,17 +36,25 @@ class VectorStore(ABC):
         """
 
     @abstractmethod
-    def similarity_search(self, query: str, k: int = 5, source_type: str | None = None) -> List[Dict[str, Any]]:
+    def similarity_search(
+        self,
+        query: str,
+        k: int = 5,
+        source_type: str | None = None,
+        owner_user_id: int | None = None,
+        exclude_email_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
         """Return the top-*k* chunks most similar to *query*.
 
         The query is embedded using the store's ``embedding_function``;
         results are returned as plain dicts matching the original chunk
         schema (``id``, ``email_id``, ``text``, ``chunk_index``,
-        ``metadata``).
+        ``metadata``). Email chunks are only returned for
+        ``owner_user_id``; ``exclude_email_id`` drops one email's chunks.
         """
 
     @abstractmethod
-    def has_email(self, email_id: str) -> bool:
+    def has_email(self, email_id: str, owner_user_id: int | None = None) -> bool:
          """Return True if an email with the given ID already exists in the store."""
 
 

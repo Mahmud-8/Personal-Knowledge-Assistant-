@@ -42,6 +42,29 @@ class Settings(BaseSettings):
         "https://www.googleapis.com/auth/gmail.readonly,"
         "https://www.googleapis.com/auth/gmail.send"
     )
+    # Gmail push notifications (Cloud Pub/Sub). See README "Gmail push
+    # notifications" for the Google Cloud setup these values come from.
+    # Full topic name: projects/<project-id>/topics/<topic>. Empty disables watch.
+    GMAIL_PUBSUB_TOPIC: str = ""
+    # OIDC push authentication: the audience configured on the push
+    # subscription and the service account it signs tokens as.
+    GMAIL_PUBSUB_AUDIENCE: str = ""
+    GMAIL_PUBSUB_SERVICE_ACCOUNT: str = ""
+    # Optional shared secret appended to the push endpoint as ?token=...
+    GMAIL_PUBSUB_VERIFICATION_TOKEN: SecretStr = SecretStr("")
+    # Optional full subscription name (projects/<id>/subscriptions/<name>);
+    # when set, pushes from any other subscription are rejected.
+    GMAIL_PUBSUB_SUBSCRIPTION: str = ""
+    # Comma-separated Gmail label IDs that trigger notifications.
+    GMAIL_WATCH_LABEL_IDS: str = "INBOX"
+    # How often the renewal task runs, and how close to expiry a watch is renewed.
+    GMAIL_WATCH_RENEW_INTERVAL_SECONDS: int = 6 * 60 * 60
+    GMAIL_WATCH_RENEW_BEFORE_SECONDS: int = 24 * 60 * 60
+    # A claimed email whose processing has not finished within this time
+    # is considered abandoned and may be claimed again.
+    GMAIL_REPLY_LOCK_TIMEOUT_SECONDS: int = 15 * 60
+    GMAIL_REPLY_MAX_ATTEMPTS: int = 3
+
     # Groq / RAG
     GROQ_API_KEY: SecretStr
     GROQ_MODEL: str = "qwen/qwen3.6-27b"
@@ -94,6 +117,20 @@ class Settings(BaseSettings):
     def google_scopes(self) -> list[str]:
         """Parse comma-separated scopes into a list."""
         return [scope.strip() for scope in self.GOOGLE_SCOPES.split(",") if scope.strip()]
+
+    @property
+    def gmail_watch_label_ids(self) -> list[str]:
+        """Parse comma-separated Gmail watch label IDs into a list."""
+        return [label.strip() for label in self.GMAIL_WATCH_LABEL_IDS.split(",") if label.strip()]
+
+    @property
+    def gmail_push_configured(self) -> bool:
+        """True when push notifications can be both requested and verified."""
+        has_auth = bool(
+            (self.GMAIL_PUBSUB_AUDIENCE and self.GMAIL_PUBSUB_SERVICE_ACCOUNT)
+            or self.GMAIL_PUBSUB_VERIFICATION_TOKEN.get_secret_value()
+        )
+        return bool(self.GMAIL_PUBSUB_TOPIC) and has_auth
 
     @property
     def google_client_config(self) -> dict:

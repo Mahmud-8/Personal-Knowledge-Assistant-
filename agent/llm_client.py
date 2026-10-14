@@ -26,15 +26,17 @@ def _get_client() -> Groq:
     return Groq(api_key=settings.GROQ_API_KEY.get_secret_value())
 
 
-def _build_tools() -> list[dict[str, Any]]:
+def _build_tools(tool_names: list[str] | None = None) -> list[dict[str, Any]]:
     """Convert TOOL_REGISTRY into the OpenAI function-calling format.
 
     Each tool function should have a `schema` attribute (a dict with
     "description" and "parameters") for its definition. Tools without
-    a schema are skipped.
+    a schema are skipped. `tool_names` limits which tools are offered.
     """
     tools = []
     for name, fn in TOOL_REGISTRY.items():
+        if tool_names is not None and name not in tool_names:
+            continue
         schema = getattr(fn, "schema", None)
         if schema is None:
             continue
@@ -49,7 +51,11 @@ def _build_tools() -> list[dict[str, Any]]:
     return tools
 
 
-def call_llm(messages: list[dict], system_prompt: str) -> dict:
+def call_llm(
+    messages: list[dict],
+    system_prompt: str,
+    tool_names: list[str] | None = None,
+) -> dict:
     """Send the conversation to Groq and return the raw response message.
 
     Returns the assistant message dict from the API. The caller
@@ -63,7 +69,7 @@ def call_llm(messages: list[dict], system_prompt: str) -> dict:
         *messages,
     ]
 
-    tools = _build_tools()
+    tools = _build_tools(tool_names)
     kwargs = {
         "model": settings.GROQ_MODEL,
         "messages": provider_messages,

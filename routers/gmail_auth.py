@@ -14,7 +14,9 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 
+from config import settings
 from initializer import db
+from services import gmail_push_service
 from services.app_auth_service import get_current_user
 from services.gmail_auth_service import (
     AuthError,
@@ -70,13 +72,21 @@ def google_callback(
         )
 
     try:
-        _service.authenticate(code, state)
+        user = _service.authenticate(code, state)
     except (StateValidationError, OAuthExchangeError, AuthError) as exc:
         logger.exception("Google authentication failed.")
         return RedirectResponse(
             url="/?google_error=" + urllib.parse.quote(str(exc)),
             status_code=status.HTTP_302_FOUND,
         )
+
+    # Start Gmail push notifications for the newly linked mailbox. Failure
+    # is not fatal: the UI shows the watch status and can retry.
+    if settings.gmail_push_configured:
+        try:
+            gmail_push_service.ensure_watch(user.id)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.exception("Starting Gmail watch after Google connect failed.")
 
     return RedirectResponse(url="/?google=connected", status_code=status.HTTP_302_FOUND)
 

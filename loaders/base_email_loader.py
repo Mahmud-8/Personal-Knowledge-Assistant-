@@ -46,6 +46,10 @@ class EmailLoaderFetchError(EmailLoaderError):
     """Raised when a loader fails to fetch or parse one or more emails."""
 
 
+class EmailLoaderParseError(EmailLoaderFetchError):
+    """Raised when a fetched email cannot be turned into a valid `Email`."""
+
+
 class EmailLoader(ABC):
     """
     Abstract base class for email loaders.

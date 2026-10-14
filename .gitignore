@@ -40,3 +40,7 @@ Desktop.ini
 
 # Claude Code
 CLAUDE.md
+.claude/
+
+# Test / tooling caches
+.pytest_cache/

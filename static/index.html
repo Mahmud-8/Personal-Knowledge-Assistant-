@@ -175,6 +175,25 @@
         }
         .user-bar span { font-weight: 600; }
         .hidden { display: none !important; }
+        .hint { font-size: 0.85em; color: #666; margin-bottom: 12px; line-height: 1.4; }
+        .toggle-row { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 12px; cursor: pointer; }
+        .toggle-row input { width: auto; margin: 0; }
+        .watch-details { font-size: 0.85em; color: #555; margin-bottom: 12px; line-height: 1.6; }
+        .activity-list { margin-top: 16px; }
+        .activity-item {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 8px 0;
+            border-top: 1px solid #eee;
+            font-size: 0.85em;
+        }
+        .activity-item .meta { min-width: 0; overflow-wrap: anywhere; }
+        .activity-item .meta small { color: #777; }
+        .activity-badge { flex-shrink: 0; padding: 2px 8px; border-radius: 10px; background: #eee; color: #333; height: fit-content; }
+        .activity-badge.ok { background: #d4edda; color: #155724; }
+        .activity-badge.warn { background: #fff3cd; color: #856404; }
+        .activity-badge.err { background: #f8d7da; color: #721c24; }
     </style>
 </head>
 <body>
@@ -237,6 +256,19 @@
             <label for="ingest-label">Gmail Label</label>
             <input type="text" id="ingest-label" value="INBOX" placeholder="INBOX">
             <button class="btn-green" id="ingest-btn" onclick="ingestEmails()">Start Ingestion</button>
+            <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 16px 0;">
+            <h3 style="font-size: 1em; margin-bottom: 8px;">Automatic Replies</h3>
+            <p class="hint">New emails are detected automatically through Gmail push notifications and always saved to your knowledge base. When automatic replies are on, the assistant answers them using your email history.</p>
+            <div id="automation-status" class="status"></div>
+            <label class="toggle-row">
+                <input type="checkbox" id="autoresponder-toggle" onchange="setAutoresponder(this.checked)" disabled>
+                Reply automatically to new emails
+            </label>
+            <div id="watch-details" class="watch-details"></div>
+            <button class="btn-primary" id="watch-start-btn" onclick="startWatch()">Enable Notifications</button>
+            <button class="btn-reset" id="watch-stop-btn" onclick="stopWatch()" style="margin-left: 8px;">Stop Notifications</button>
+            <button class="btn-reset" onclick="loadAutomationStatus()" style="margin-left: 8px;">Refresh</button>
+            <div id="automation-activity" class="activity-list"></div>
         </div>
 
         <!-- Slack -->
@@ -384,12 +416,15 @@
             }
         }
 
+        let ingestStatusTimer = null;
+
         async function ingestEmails() {
             const el = document.getElementById('ingest-status');
             const btn = document.getElementById('ingest-btn');
             const maxEmails = document.getElementById('ingest-max').value;
             const label = document.getElementById('ingest-label').value.trim();
 
+            clearTimeout(ingestStatusTimer);
             btn.disabled = true;
             el.className = 'status info';
             el.textContent = 'Starting ingestion...';
@@ -439,6 +474,10 @@
                         el.className = 'status success';
                         el.textContent = `Done! ${data.fetched} emails fetched, ${data.chunks_stored} chunks stored.`;
                         btn.disabled = false;
+                        ingestStatusTimer = setTimeout(() => {
+                            el.className = 'status';
+                            el.textContent = '';
+                        }, 7000);
                     } else if (data.state === 'error') {
                         clearInterval(interval);
                         el.className = 'status error';
@@ -1084,6 +1123,7 @@
             document.getElementById('user-greeting').textContent = 'Welcome, ' + (userEmail || '');
             checkHealth();
             checkGoogleStatus();
+            loadAutomationStatus();
         }
 
         function logout() {
@@ -1213,6 +1253,131 @@
                     el.textContent = 'Not connected. Connect your Google account to ingest emails.';
                 }
             } catch {}
+        }
+
+        // --- Gmail notifications & automatic replies ---
+        const ACTIVITY_LABELS = {
+            new: ['Processing', ''],
+            replied: ['Replied', 'ok'],
+            failed: ['Reply failed', 'err'],
+            invalid: ['Unreadable email', 'err'],
+            skipped_disabled: ['Saved (auto-reply off)', 'warn'],
+            skipped_owner: ['Your own email', ''],
+            skipped_manual_reply: ['You already replied', 'ok'],
+            skipped_automated: ['Automated sender', ''],
+            skipped_not_inbox: ['Not in inbox', ''],
+            skipped_resync: ['Saved during resync', 'warn'],
+            skipped_ignored: ['Draft/spam ignored', ''],
+        };
+
+        async function gmailRequest(method, path, body) {
+            const opts = { method, headers: { 'Authorization': 'Bearer ' + authToken } };
+            if (body !== undefined) {
+                opts.headers['Content-Type'] = 'application/json';
+                opts.body = JSON.stringify(body);
+            }
+            const res = await fetch('/api/v1/gmail' + path, opts);
+            if (handleUnauthorized(res)) return null;
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || ('Request failed (' + res.status + ')'));
+            return data;
+        }
+
+        function renderAutomation(data) {
+            const el = document.getElementById('automation-status');
+            const toggle = document.getElementById('autoresponder-toggle');
+            const details = document.getElementById('watch-details');
+            const startBtn = document.getElementById('watch-start-btn');
+            const stopBtn = document.getElementById('watch-stop-btn');
+            const watch = data.watch;
+
+            toggle.checked = data.autoresponder_enabled;
+            toggle.disabled = !data.google_connected;
+            startBtn.disabled = !data.google_connected || !data.push_configured;
+            stopBtn.disabled = !watch || watch.status === 'stopped';
+
+            if (!data.google_connected) {
+                el.className = 'status info';
+                el.textContent = 'Connect your Google account to enable notifications and automatic replies.';
+            } else if (!data.push_configured) {
+                el.className = 'status error';
+                el.textContent = 'Gmail push notifications are not configured on the server. New emails cannot be detected yet.';
+            } else if (!watch || watch.status === 'stopped') {
+                el.className = 'status info';
+                el.textContent = 'Notifications are off. Click "Enable Notifications" to start detecting new emails.';
+            } else if (watch.status === 'error' || watch.last_error) {
+                el.className = 'status error';
+                el.textContent = 'Notification problem: ' + (watch.last_error || 'unknown error');
+            } else {
+                el.className = 'status success';
+                el.textContent = 'Watching ' + watch.email_address + ' for new emails. Automatic replies are '
+                    + (data.autoresponder_enabled ? 'on.' : 'off; new emails are still saved.');
+            }
+
+            details.innerHTML = watch ? [
+                'Notifications: ' + escapeHtml(watch.status) + (watch.expires_at ? ' (renews automatically, current watch expires ' + escapeHtml(formatDate(watch.expires_at)) + ')' : ''),
+                'Last notification: ' + escapeHtml(watch.last_notification_at ? formatDate(watch.last_notification_at) : 'none yet'),
+                'Last sync: ' + escapeHtml(watch.last_sync_at ? formatDate(watch.last_sync_at) : 'none yet'),
+            ].join('<br>') : '';
+
+            const list = document.getElementById('automation-activity');
+            if (!data.recent_activity.length) {
+                list.innerHTML = data.google_connected ? '<p class="hint">No new emails processed yet.</p>' : '';
+                return;
+            }
+            list.innerHTML = data.recent_activity.map(item => {
+                const [label, cls] = ACTIVITY_LABELS[item.status] || [item.status, ''];
+                const note = item.error ? '<br><small>' + escapeHtml(item.error) + '</small>' : '';
+                return '<div class="activity-item"><div class="meta"><strong>' + escapeHtml(item.subject || '(no subject)')
+                    + '</strong><br><small>' + escapeHtml(item.sender || '') + ' · ' + escapeHtml(formatDate(item.updated_at))
+                    + (item.indexed ? '' : ' · not yet saved') + '</small>' + note + '</div>'
+                    + '<span class="activity-badge ' + cls + '">' + escapeHtml(label) + '</span></div>';
+            }).join('');
+        }
+
+        function showAutomationError(e) {
+            const el = document.getElementById('automation-status');
+            el.className = 'status error';
+            el.textContent = e.message;
+        }
+
+        async function loadAutomationStatus() {
+            try {
+                const data = await gmailRequest('GET', '/automation');
+                if (data) renderAutomation(data);
+            } catch (e) { showAutomationError(e); }
+        }
+
+        async function setAutoresponder(enabled) {
+            const toggle = document.getElementById('autoresponder-toggle');
+            toggle.disabled = true;
+            try {
+                const data = await gmailRequest('PUT', '/autoresponder', { enabled });
+                if (data) renderAutomation(data);
+            } catch (e) {
+                toggle.checked = !enabled;
+                toggle.disabled = false;
+                showAutomationError(e);
+            }
+        }
+
+        async function startWatch() {
+            const btn = document.getElementById('watch-start-btn');
+            btn.disabled = true;
+            try {
+                const data = await gmailRequest('POST', '/watch');
+                if (data) renderAutomation(data);
+            } catch (e) {
+                btn.disabled = false;
+                showAutomationError(e);
+            }
+        }
+
+        async function stopWatch() {
+            try {
+                const data = await gmailRequest('DELETE', '/watch');
+                if (data) renderAutomation(data);
+            } catch (e) { showAutomationError(e); }
         }
 
         // Auto-login if token exists

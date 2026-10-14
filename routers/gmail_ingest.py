@@ -64,11 +64,12 @@ def _run_ingest(
         _ingest_status[user_id]["fetched"] = len(emails)
         _ingest_status[user_id]["state"] = "processing"
 
-        # Keep only emails that are not already present in Chroma.
+        # Keep only emails that are not already present in Chroma for this
+        # user; tagging the owner keeps one user's mail out of another's searches.
         new_emails = [
-            email
+            email.model_copy(update={"owner_user_id": user_id})
             for email in emails
-            if not store.has_email(email.id)
+            if not store.has_email(email.id, owner_user_id=user_id)
         ]
 
         _ingest_status[user_id]["new_emails"] = len(new_emails)

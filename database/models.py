@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, false, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -21,6 +21,10 @@ class User(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     email: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # Opt-in: the AI only replies to incoming Gmail when this is True.
+    autoresponder_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -145,4 +149,77 @@ class CleanedMessageRow(Base):
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# BIGINT ids that still autoincrement on SQLite (used by the test suite).
+_BigIntId = BigInteger().with_variant(Integer, "sqlite")
+
+
+class GmailSyncStateRow(Base):
+    """Per-user Gmail push-notification (users.watch) and history sync state."""
+
+    __tablename__ = "gmail_sync_states"
+
+    id: Mapped[int] = mapped_column(_BigIntId, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    # Mailbox address Gmail puts in every notification; maps it to the user.
+    email_address: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    # Last Gmail historyId fully processed; history.list starts from here.
+    history_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # "active", "stopped" or "error".
+    watch_status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    watch_expiration: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_notification_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class GmailReplyStateRow(Base):
+    """Processing state of one Gmail message for the auto-responder.
+
+    One row per (user, Gmail message). `locked_at` is a processing lease:
+    a worker owns the message while it is set and younger than the lock
+    timeout, so retried or concurrent notifications cannot reply twice.
+    """
+
+    __tablename__ = "gmail_reply_states"
+
+    id: Mapped[int] = mapped_column(_BigIntId, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    gmail_message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    thread_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sender: Mapped[str | None] = mapped_column(Text, nullable=True)
+    subject: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # new | replied | failed | skipped_owner | skipped_automated |
+    # skipped_disabled | skipped_manual_reply | skipped_resync | skipped_not_inbox | invalid
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="new")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lock_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    incoming_indexed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reply_message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_indexed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Retrying a failed send is only safe when no email can have gone out.
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "gmail_message_id", name="uq_gmail_reply_user_message"),
     )

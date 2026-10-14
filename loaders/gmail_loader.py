@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from datetime import datetime, timezone
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any, Dict, List, Optional
@@ -34,11 +35,22 @@ from googleapiclient.errors import HttpError
 
 from config import settings
 from models import Attachment, Email
-from .base_email_loader import EmailLoader, EmailLoaderConnectionError, EmailLoaderFetchError
+from .base_email_loader import (
+    EmailLoader,
+    EmailLoaderConnectionError,
+    EmailLoaderFetchError,
+    EmailLoaderParseError,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+# Senders that never read replies (RFC 3834 recommends not auto-replying).
+_NO_REPLY_SENDER = re.compile(
+    r"^(no-?reply|do-?not-?reply|mailer-daemon|postmaster|bounces?)([+.@-]|$)",
+    re.IGNORECASE,
+)
 
 
 class GmailLoader(EmailLoader):
@@ -56,6 +68,9 @@ class GmailLoader(EmailLoader):
     label:
         Gmail label or folder to read from (e.g. "INBOX", "SENT",
         a custom label name, or a label ID).
+    credentials:
+        Ready-to-use Google credentials. When given, they are used as-is
+        instead of building credentials from the tokens.
     """
 
     def __init__(
@@ -64,11 +79,13 @@ class GmailLoader(EmailLoader):
         refresh_token: Optional[str] = None,
         max_emails: int = 50,
         label: str = "INBOX",
+        credentials: Optional[Credentials] = None,
     ) -> None:
         self.access_token = access_token
         self.refresh_token = refresh_token
         self.max_emails = max_emails
         self.label = label
+        self._provided_creds = credentials
 
         self._service: Optional[Resource] = None
         self._creds: Optional[Credentials] = None
@@ -136,12 +153,26 @@ class GmailLoader(EmailLoader):
         )
         return emails
 
+    def fetch_email(self, message_id: str) -> Email:
+        """Fetch and parse a single email by its Gmail message ID."""
+        if not self.is_connected:
+            raise EmailLoaderConnectionError("Not connected. Call connect() first.")
+
+        raw_message = self._download_message(message_id)
+        try:
+            return self._parse_email(message_id, raw_message)
+        except Exception as exc:
+            raise EmailLoaderParseError(f"Failed to parse message {message_id}: {exc}") from exc
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     def _build_credentials(self) -> Credentials:
         """Build Google credentials from stored tokens, refreshing if needed."""
+        if self._provided_creds is not None:
+            return self._provided_creds
+
         creds = Credentials(
             token=self.access_token,
             refresh_token=self.refresh_token,
@@ -264,6 +295,9 @@ class GmailLoader(EmailLoader):
         subject = headers.get("subject", "")
         _, sender_addr = parseaddr(headers.get("from", ""))
         recipients = self._parse_recipients(headers.get("to", ""))
+        if not recipients:
+            # e.g. Bcc-only mail: fall back to the receiving mailbox.
+            recipients = self._parse_recipients(headers.get("delivered-to", ""))
         date = self._parse_date(headers.get("date"), raw_message.get("internalDate"))
         body = self._extract_body(payload)
         attachments = self._extract_attachments(payload)
@@ -276,7 +310,25 @@ class GmailLoader(EmailLoader):
             body=body,
             date=date,
             attachments=attachments,
+            thread_id=raw_message.get("threadId"),
+            rfc_message_id=headers.get("message-id"),
+            label_ids=list(raw_message.get("labelIds") or []),
+            is_automated=self._is_automated(headers, sender_addr),
         )
+
+    @staticmethod
+    def _is_automated(headers: Dict[str, str], sender_addr: str) -> bool:
+        """True for auto-replies, bulk/list mail and no-reply senders."""
+        auto_submitted = headers.get("auto-submitted", "").strip().lower()
+        if auto_submitted and auto_submitted != "no":
+            return True
+        if headers.get("precedence", "").strip().lower() in {"bulk", "junk", "list", "auto_reply"}:
+            return True
+        if "list-id" in headers or "list-unsubscribe" in headers:
+            return True
+        if "x-autoreply" in headers or "x-autorespond" in headers:
+            return True
+        return bool(_NO_REPLY_SENDER.match(sender_addr or ""))
 
     @staticmethod
     def _parse_recipients(to_header: str) -> List[str]:

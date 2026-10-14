@@ -10,16 +10,11 @@ Every function must:
 
 from __future__ import annotations
 
-import base64
-from email.message import EmailMessage
-
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-
 from agent.tool_result import ToolResult
-from config import settings
-from initializer import db, store
+from initializer import store
+from services import gmail_service
+from services.gmail_service import GmailSendError
+from services.gmail_auth_service import AuthError
 
 VALID_SOURCES = {"email", "slack", "discord", "telegram", "pdf"}
 
@@ -54,6 +49,8 @@ def search(arguments: dict) -> ToolResult:
         query,
         k=k,
         source_type=source,
+        owner_user_id=arguments.get("_user_id"),
+        exclude_email_id=arguments.get("_exclude_email_id"),
     )
 
     if not results:
@@ -111,184 +108,106 @@ search.schema = {
 # ------------------------------------------------------------------
 
 
+def reply_subject(original_subject: str | None) -> str:
+    """'Re: <original subject>', without stacking a second 'Re:'."""
+    subject = (original_subject or "").strip()
+    if subject.lower().startswith("re:"):
+        return subject
+    return f"Re: {subject}".strip()
+
+
+def _send_failed(error: str) -> ToolResult:
+    """A failure raised before anything was handed to Gmail (safe to retry)."""
+    return ToolResult(
+        tool_name="send_email_reply",
+        success=False,
+        data={"retryable": True},
+        error=error,
+    )
+
+
 def send_email_reply(arguments: dict) -> ToolResult:
     """
-    Send an email using the authenticated user's connected Gmail account.
+    Send a reply to the incoming email being handled, from the user's
+    connected Gmail account.
 
-    `_user_id` is injected internally by the controller and is not part
-    of the LLM-facing tool schema.
+    `_user_id` and `_incoming_email` are injected by the tool execution
+    layer and are not part of the LLM-facing tool schema.
     """
     user_id = arguments.get("_user_id")
-    to = arguments.get("to")
-    subject = arguments.get("subject", "")
-    body = arguments.get("body", "")
-
-    # --------------------------------------------------------------
-    # Validate arguments
-    # --------------------------------------------------------------
+    incoming_email = arguments.get("_incoming_email")
+    to = (arguments.get("to") or "").strip()
+    body = arguments.get("body") or ""
 
     if user_id is None:
-        return ToolResult(
-            tool_name="send_email_reply",
-            success=False,
-            error="Missing authenticated user context.",
-        )
+        return _send_failed("Missing authenticated user context.")
+
+    if incoming_email is None:
+        return _send_failed("send_email_reply can only be used while handling an incoming email.")
 
     if not to:
-        return ToolResult(
-            tool_name="send_email_reply",
-            success=False,
-            error="Missing required argument: to",
-        )
+        return _send_failed("Missing required argument: to")
 
-    if not body:
-        return ToolResult(
-            tool_name="send_email_reply",
-            success=False,
-            error="Missing required argument: body",
-        )
+    # A reply always goes back to the original sender; this also stops
+    # instructions inside an email body from redirecting the reply.
+    if to.lower() != incoming_email.sender.lower():
+        return _send_failed(f"Recipient must be the original sender: {incoming_email.sender}")
 
-    # --------------------------------------------------------------
-    # Get connected Gmail credentials
-    # --------------------------------------------------------------
+    if not body.strip():
+        return _send_failed("Missing required argument: body")
 
-    credentials_row = db.find_google_credentials(user_id)
-
-    if credentials_row is None:
-        return ToolResult(
-            tool_name="send_email_reply",
-            success=False,
-            error="No Google account is connected to this user.",
-        )
+    # The subject is derived from the original so the reply always threads
+    # correctly, whatever the model put in the `subject` argument.
+    subject = reply_subject(incoming_email.subject)
 
     try:
-        # Reconstruct Google OAuth credentials from the tokens stored
-        # in PostgreSQL.
-        creds = Credentials(
-            token=credentials_row.access_token,
-            refresh_token=credentials_row.refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=settings.GOOGLE_CLIENT_ID,
-            client_secret=settings.GOOGLE_CLIENT_SECRET.get_secret_value(),
-            scopes=settings.google_scopes,
+        sent = gmail_service.send_email(
+            user_id,
+            to=to,
+            subject=subject,
+            body=body,
+            thread_id=incoming_email.thread_id,
+            in_reply_to=incoming_email.rfc_message_id,
         )
+    # Both errors mean Gmail did not accept the message, so a later
+    # retry cannot produce a duplicate.
+    except AuthError as exc:
+        return _send_failed(f"Gmail authentication failed: {exc}")
+    except GmailSendError as exc:
+        return _send_failed(f"Failed to send email: {exc}")
 
-        # ----------------------------------------------------------
-        # Refresh expired access token when possible
-        # ----------------------------------------------------------
-
-        if not creds.valid:
-            if not creds.refresh_token:
-                return ToolResult(
-                    tool_name="send_email_reply",
-                    success=False,
-                    error=(
-                        "Gmail access token is invalid and "
-                        "no refresh token is available."
-                    ),
-                )
-
-            creds.refresh(Request())
-
-            # Persist refreshed credentials so the next request can
-            # use the new access token.
-            db.save_google_credentials(
-                user_id,
-                google_id=credentials_row.google_id,
-                access_token=creds.token,
-                refresh_token=(
-                    creds.refresh_token
-                    or credentials_row.refresh_token
-                ),
-                token_expiry=creds.expiry,
-            )
-
-        # ----------------------------------------------------------
-        # Build MIME email
-        # ----------------------------------------------------------
-
-        message = EmailMessage()
-        message["To"] = to
-        message["Subject"] = subject
-        message.set_content(body)
-
-        raw_message = base64.urlsafe_b64encode(
-            message.as_bytes()
-        ).decode("utf-8")
-
-        # ----------------------------------------------------------
-        # Send through Gmail API
-        # ----------------------------------------------------------
-
-        service = build(
-            "gmail",
-            "v1",
-            credentials=creds,
-            cache_discovery=False,
-        )
-
-        result = (
-            service.users()
-            .messages()
-            .send(
-                userId="me",
-                body={"raw": raw_message},
-            )
-            .execute()
-        )
-
-        profile = (
-            service.users()
-            .getProfile(userId="me")
-            .execute()
-        )
-
-        sender_email = profile.get("emailAddress")
-
-        return ToolResult(
-            tool_name="send_email_reply",
-            success=True,
-            data={
-                "message_id": result.get("id"),
-                "sender": sender_email,
-                "to": to,
-                "subject": subject,
-                "body": body,
-                "message": "Email sent successfully.",
-            },
-        )
-
-    except Exception as exc:
-        # Do not expose tokens or credentials in the response.
-        logger = __import__("logging").getLogger(__name__)
-        logger.exception("Failed to send Gmail message.")
-
-        return ToolResult(
-            tool_name="send_email_reply",
-            success=False,
-            error=f"Failed to send email: {exc}",
-        )
+    return ToolResult(
+        tool_name="send_email_reply",
+        success=True,
+        data={
+            **sent,
+            "to": to,
+            "subject": subject,
+            "body": body,
+            "message": "Email sent successfully.",
+        },
+    )
 
 
 send_email_reply.schema = {
     "description": (
-        "Send a reply email from the authenticated user's "
-        "connected Gmail account."
+        "Send a reply to the incoming email from the user's connected "
+        "Gmail account. Only use this when handling a 'New email' message."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "to": {
                 "type": "string",
-                "description": "Recipient email address.",
+                "description": "Recipient email address (the original sender).",
             },
             "subject": {
                 "type": "string",
-                "description": "Email subject line.",
+                "description": "Reply subject line, e.g. 'Re: <original subject>'.",
             },
             "body": {
                 "type": "string",
-                "description": "Plain-text email body.",
+                "description": "Plain-text reply body.",
             },
         },
         "required": ["to", "subject", "body"],

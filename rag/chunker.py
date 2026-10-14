@@ -87,8 +87,14 @@ class LangChainChunker():
     def _extract(self, source: Union[Email, Document, SlackMessage, DiscordMessage, TelegramMessage]) -> tuple[str, str, dict]:
         """Extract id, text, and metadata from the source."""
         if isinstance(source, Email):
+            # Gmail message IDs are only unique within one mailbox.
+            doc_id = (
+                f"user{source.owner_user_id}_{source.id}"
+                if source.owner_user_id is not None
+                else source.id
+            )
             return (
-                source.id,
+                doc_id,
                 source.body or "",
                 {
                     "source_type": "email",
@@ -97,6 +103,10 @@ class LangChainChunker():
                     "recipients": list(source.recipients),
                     "subject": source.subject,
                     "date": source.date.isoformat() if source.date else None,
+                    "thread_id": source.thread_id,
+                    "in_reply_to": source.in_reply_to,
+                    "owner_user_id": source.owner_user_id,
+                    "auto_reply": source.auto_reply,
                 },
             )
 

@@ -7,6 +7,11 @@ Tracks the message history in the OpenAI messages format
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from models import Email
+
 
 class AgentState:
     """Holds the authenticated user context and conversation history."""
@@ -16,9 +21,17 @@ class AgentState:
         user_id: int,
         user_input: str,
         messages: list[dict] | None = None,
+        incoming_email: Email | None = None,
     ) -> None:
         self.user_id = user_id
         self.user_input = user_input
+        # Set when the agent is handling a new incoming email (not chat).
+        self.incoming_email = incoming_email
+        # Results of successful send_email_reply calls / last send failure.
+        self.sent_emails: list[dict] = []
+        self.send_email_error: str | None = None
+        # False once a send failed in a way that may have delivered the email.
+        self.send_email_retryable: bool = True
         self.messages: list[dict] = list(messages) if messages else []
         self.messages.append({
             "role": "user",

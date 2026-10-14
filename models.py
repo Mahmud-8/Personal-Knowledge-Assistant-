@@ -48,6 +48,28 @@ class Email(BaseModel):
     attachments: List[Attachment] = Field(
         default_factory=list, description="List of attachments, if any"
     )
+    thread_id: Optional[str] = Field(
+        default=None, description="Provider thread/conversation ID"
+    )
+    rfc_message_id: Optional[str] = Field(
+        default=None, description="RFC 2822 Message-ID header, used for reply threading"
+    )
+    in_reply_to: Optional[str] = Field(
+        default=None, description="ID of the email this email replies to"
+    )
+    label_ids: List[str] = Field(
+        default_factory=list, description="Provider labels, e.g. Gmail INBOX/SENT"
+    )
+    is_automated: bool = Field(
+        default=False,
+        description="Headers mark this as machine-generated (auto-reply, bulk, list mail)",
+    )
+    owner_user_id: Optional[int] = Field(
+        default=None, description="Application user whose mailbox this email belongs to"
+    )
+    auto_reply: bool = Field(
+        default=False, description="True for replies sent by the AI auto-responder"
+    )
 
     @field_validator("id")
     @classmethod

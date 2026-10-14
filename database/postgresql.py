@@ -12,27 +12,50 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import psycopg2
 from psycopg2 import sql
-from sqlalchemy import create_engine, select
+from sqlalchemy import Engine, and_, create_engine, delete, or_, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from config import Settings
 from .base_database import BaseDatabase
-from .models import Base, CleanedMessageRow, DiscordCredentialRow, GoogleCredentialRow, SlackCredentialRow, TelegramCredentialRow, User
+from .models import (
+    Base,
+    CleanedMessageRow,
+    DiscordCredentialRow,
+    GmailReplyStateRow,
+    GmailSyncStateRow,
+    GoogleCredentialRow,
+    SlackCredentialRow,
+    TelegramCredentialRow,
+    User,
+)
 
 logger = logging.getLogger(__name__)
+
+# Idempotent schema changes for tables that already existed before a column
+# was added; `create_all` only creates missing tables, never missing columns.
+_MIGRATIONS = [
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+    "autoresponder_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+]
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class Database(BaseDatabase):
     """PostgreSQL implementation of the database access layer."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, engine: Optional[Engine] = None) -> None:
         self._settings = settings
-        self._engine = create_engine(
+        self._engine = engine or create_engine(
             settings.database_url,
             pool_size=settings.POSTGRES_POOL_SIZE,
             pool_pre_ping=True,
@@ -73,6 +96,9 @@ class Database(BaseDatabase):
     def create_tables(self) -> None:
         """Create all ORM-defined tables if they do not already exist."""
         Base.metadata.create_all(self._engine)
+        with self._engine.begin() as conn:
+            for statement in _MIGRATIONS:
+                conn.execute(text(statement))
 
     # ------------------------------------------------------------------
     # Users
@@ -485,3 +511,251 @@ class Database(BaseDatabase):
                     "created_at": r.created_at.isoformat() if r.created_at else None,
                 })
             return results
+
+    # ------------------------------------------------------------------
+    # Gmail auto-responder settings
+    # ------------------------------------------------------------------
+
+    def get_autoresponder_enabled(self, user_id: int) -> bool:
+        with self._session() as session:
+            stmt = select(User.autoresponder_enabled).where(User.id == user_id)
+            return bool(session.scalars(stmt).first())
+
+    def set_autoresponder_enabled(self, user_id: int, enabled: bool) -> None:
+        with self._session() as session:
+            session.execute(
+                update(User).where(User.id == user_id).values(autoresponder_enabled=enabled)
+            )
+            session.commit()
+
+    # ------------------------------------------------------------------
+    # Gmail watch / history sync state
+    # ------------------------------------------------------------------
+
+    def find_gmail_sync_state(self, user_id: int) -> Optional[GmailSyncStateRow]:
+        with self._session() as session:
+            stmt = select(GmailSyncStateRow).where(GmailSyncStateRow.user_id == user_id)
+            row = session.scalars(stmt).first()
+            if row:
+                session.expunge(row)
+            return row
+
+    def find_gmail_sync_state_by_email(self, email_address: str) -> Optional[GmailSyncStateRow]:
+        with self._session() as session:
+            stmt = select(GmailSyncStateRow).where(
+                GmailSyncStateRow.email_address == email_address.strip().lower()
+            )
+            row = session.scalars(stmt).first()
+            if row:
+                session.expunge(row)
+            return row
+
+    def list_gmail_sync_states(self) -> List[GmailSyncStateRow]:
+        with self._session() as session:
+            rows = list(session.scalars(select(GmailSyncStateRow)))
+            for row in rows:
+                session.expunge(row)
+            return rows
+
+    def save_gmail_watch(
+        self,
+        user_id: int,
+        *,
+        email_address: str,
+        history_id: int,
+        expiration: Optional[datetime],
+        reset_history: bool = False,
+    ) -> GmailSyncStateRow:
+        email_address = email_address.strip().lower()
+        with self._session() as session:
+            # A mailbox belongs to one user; drop a stale mapping left by a
+            # previous link of the same Google account.
+            session.execute(
+                delete(GmailSyncStateRow).where(
+                    GmailSyncStateRow.email_address == email_address,
+                    GmailSyncStateRow.user_id != user_id,
+                )
+            )
+            stmt = select(GmailSyncStateRow).where(GmailSyncStateRow.user_id == user_id)
+            row = session.scalars(stmt).first()
+            if row is None:
+                row = GmailSyncStateRow(user_id=user_id, email_address=email_address)
+                session.add(row)
+            elif row.email_address != email_address:
+                # A different mailbox was connected: its history starts fresh.
+                row.email_address = email_address
+                row.history_id = None
+
+            # Renewing keeps the existing pointer so no message is skipped.
+            if row.history_id is None or reset_history:
+                row.history_id = history_id
+            row.watch_status = "active"
+            row.watch_expiration = expiration
+            row.last_error = None
+
+            session.commit()
+            session.refresh(row)
+            session.expunge(row)
+            return row
+
+    def update_gmail_sync_state(self, user_id: int, **fields: Any) -> None:
+        if not fields:
+            return
+        with self._session() as session:
+            session.execute(
+                update(GmailSyncStateRow)
+                .where(GmailSyncStateRow.user_id == user_id)
+                .values(**fields)
+            )
+            session.commit()
+
+    def advance_gmail_history_id(self, user_id: int, history_id: int) -> bool:
+        with self._session() as session:
+            result = session.execute(
+                update(GmailSyncStateRow)
+                .where(
+                    GmailSyncStateRow.user_id == user_id,
+                    or_(
+                        GmailSyncStateRow.history_id.is_(None),
+                        GmailSyncStateRow.history_id < history_id,
+                    ),
+                )
+                .values(history_id=history_id)
+            )
+            session.commit()
+            return result.rowcount == 1
+
+    # ------------------------------------------------------------------
+    # Gmail reply states (processing lease + outcome per message)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _gmail_reply_needs_work():
+        """Rows whose reply decision or indexing is still unfinished."""
+        row = GmailReplyStateRow
+        return or_(
+            and_(row.status.in_(("new", "failed")), row.retryable.is_(True)),
+            row.incoming_indexed.is_(False),
+            and_(row.reply_message_id.is_not(None), row.reply_indexed.is_(False)),
+        )
+
+    def claim_gmail_message(
+        self,
+        user_id: int,
+        gmail_message_id: str,
+        *,
+        lock_timeout: timedelta,
+        max_attempts: int,
+    ) -> Optional[GmailReplyStateRow]:
+        now = _utcnow()
+        token = uuid.uuid4().hex
+        row = GmailReplyStateRow
+
+        with self._session() as session:
+            try:
+                # First sight of this message: the unique constraint makes
+                # the insert itself the claim.
+                session.add(GmailReplyStateRow(
+                    user_id=user_id,
+                    gmail_message_id=gmail_message_id,
+                    status="new",
+                    attempts=1,
+                    locked_at=now,
+                    lock_token=token,
+                ))
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                # Existing row: a single conditional UPDATE is atomic, so at
+                # most one worker can take the lease.
+                result = session.execute(
+                    update(row)
+                    .where(
+                        row.user_id == user_id,
+                        row.gmail_message_id == gmail_message_id,
+                        or_(row.locked_at.is_(None), row.locked_at < now - lock_timeout),
+                        row.attempts < max_attempts,
+                        self._gmail_reply_needs_work(),
+                    )
+                    .values(locked_at=now, lock_token=token, attempts=row.attempts + 1)
+                    .execution_options(synchronize_session=False)
+                )
+                session.commit()
+                if result.rowcount != 1:
+                    return None
+
+            claimed = session.scalars(
+                select(row).where(
+                    row.user_id == user_id,
+                    row.gmail_message_id == gmail_message_id,
+                    row.lock_token == token,
+                )
+            ).first()
+            if claimed:
+                session.expunge(claimed)
+            return claimed
+
+    def update_gmail_reply_state(
+        self,
+        user_id: int,
+        gmail_message_id: str,
+        lock_token: str,
+        *,
+        release: bool = False,
+        **fields: Any,
+    ) -> bool:
+        if release:
+            fields.update(locked_at=None, lock_token=None)
+        if not fields:
+            return True
+        row = GmailReplyStateRow
+        with self._session() as session:
+            result = session.execute(
+                update(row)
+                .where(
+                    row.user_id == user_id,
+                    row.gmail_message_id == gmail_message_id,
+                    row.lock_token == lock_token,
+                )
+                .values(**fields)
+                .execution_options(synchronize_session=False)
+            )
+            session.commit()
+            return result.rowcount == 1
+
+    def list_gmail_reply_work(
+        self,
+        user_id: int,
+        *,
+        lock_timeout: timedelta,
+        max_attempts: int,
+        limit: int = 20,
+    ) -> List[str]:
+        row = GmailReplyStateRow
+        cutoff = _utcnow() - lock_timeout
+        with self._session() as session:
+            stmt = (
+                select(row.gmail_message_id)
+                .where(
+                    row.user_id == user_id,
+                    or_(row.locked_at.is_(None), row.locked_at < cutoff),
+                    row.attempts < max_attempts,
+                    self._gmail_reply_needs_work(),
+                )
+                .order_by(row.id)
+                .limit(limit)
+            )
+            return list(session.scalars(stmt))
+
+    def list_gmail_reply_states(self, user_id: int, limit: int = 10) -> List[GmailReplyStateRow]:
+        with self._session() as session:
+            stmt = (
+                select(GmailReplyStateRow)
+                .where(GmailReplyStateRow.user_id == user_id)
+                .order_by(GmailReplyStateRow.updated_at.desc(), GmailReplyStateRow.id.desc())
+                .limit(limit)
+            )
+            rows = list(session.scalars(stmt))
+            for r in rows:
+                session.expunge(r)
+            return rows

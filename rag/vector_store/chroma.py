@@ -44,6 +44,43 @@ from .base_vector_store import VectorStore
 logger = logging.getLogger(__name__)
 
 
+def build_where(
+    source_type: str | None,
+    owner_user_id: int | None,
+    exclude_email_id: str | None = None,
+) -> Dict[str, Any] | None:
+    """Build the Chroma metadata filter for a search.
+
+    Email chunks belong to one user's mailbox, so they are only returned
+    for that user (and never when no user is known). Other sources keep
+    their existing behaviour.
+    """
+    if source_type and source_type != "email":
+        return {"source_type": source_type}
+
+    if source_type == "email":
+        if owner_user_id is None:
+            # Unscoped email search would expose other users' mail.
+            return {"$and": [{"source_type": "email"}, {"owner_user_id": -1}]}
+        conditions: List[Dict[str, Any]] = [
+            {"source_type": "email"},
+            {"owner_user_id": owner_user_id},
+        ]
+        if exclude_email_id:
+            conditions.append({"email_id": {"$ne": exclude_email_id}})
+        return {"$and": conditions}
+
+    # All sources: everything except other users' email.
+    if owner_user_id is None:
+        return {"source_type": {"$ne": "email"}}
+    return {
+        "$or": [
+            {"source_type": {"$ne": "email"}},
+            {"owner_user_id": owner_user_id},
+        ]
+    }
+
+
 class ChromaVectorStore(VectorStore):
     """Vector store backed by ChromaDB with persistent storage."""
 
@@ -110,7 +147,9 @@ class ChromaVectorStore(VectorStore):
             ids.append(chunk.get("id", ""))
             embeddings.append(item["vector"])
 
-        self._collection.add(
+        # Upsert keeps re-ingesting the same document idempotent: a retry
+        # after a partial failure overwrites chunks instead of duplicating.
+        self._collection.upsert(
             documents=documents,
             metadatas=metadata,
             ids=ids,
@@ -123,14 +162,21 @@ class ChromaVectorStore(VectorStore):
             self._collection_name,
         )
 
-    def similarity_search(self, query: str, k: int = 5, source_type: str | None = None) -> List[Dict[str, Any]]:
+    def similarity_search(
+        self,
+        query: str,
+        k: int = 5,
+        source_type: str | None = None,
+        owner_user_id: int | None = None,
+        exclude_email_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
         """Return the top-*k* chunks most similar to *query*.
 
         The query is embedded using the stored embedder; results are
         reconstructed into the original chunk dict schema.
         """
         query_vector = self._embedder.encode([query])[0]
-        where = {"source_type": source_type} if source_type else None
+        where = build_where(source_type, owner_user_id, exclude_email_id)
         results = self._collection.query(query_embeddings=[query_vector], n_results=k, where=where)
 
         if not results["ids"] or not results["ids"][0]:
@@ -151,18 +197,21 @@ class ChromaVectorStore(VectorStore):
 
         return chunks
 
-    def has_email(self, email_id: str) -> bool:
-        """Return True if an email with the given ID already exists."""
+    def has_email(self, email_id: str, owner_user_id: int | None = None) -> bool:
+        """Return True if an email with the given ID already exists
+        (in `owner_user_id`'s mailbox, when given)."""
         if not email_id:
              return False
 
+        conditions: List[Dict[str, Any]] = [
+            {"source_type": "email"},
+            {"email_id": email_id},
+        ]
+        if owner_user_id is not None:
+            conditions.append({"owner_user_id": owner_user_id})
+
         results = self._collection.get(
-            where={
-                "$and": [
-                    {"source_type": "email"},
-                    {"email_id": email_id},
-                ]
-            },
+            where={"$and": conditions},
             limit=1,
         )
 
